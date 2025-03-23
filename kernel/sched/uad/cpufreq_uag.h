@@ -6,10 +6,6 @@
 #ifndef _CPUFREQ_UAG_H_
 #define _CPUFREQ_UAG_H_
 #include <linux/cpufreq_health.h>
-#include <linux/irq_work.h>
-#include <linux/sched/walt.h>
-#include <linux/trace.h>
-
 
 enum ua_util_type {
 	UA_UTIL_SYS,
@@ -25,33 +21,24 @@ struct multi_target_loads {
 
 struct uag_gov_tunables {
 	struct gov_attr_set		attr_set;
+	unsigned int			rate_limit_us;
 	unsigned int			hispeed_load;
 	unsigned int			hispeed_freq;
 	bool				cobuck_enable;
-	unsigned int		up_rate_limit_us;
-	unsigned int		down_rate_limit_us;
 	spinlock_t			target_loads_lock;
 	unsigned int			*target_loads;
 	unsigned int			*util_loads;
 	int				ntarget_loads;
-
-#ifdef CONFIG_OPLUS_UAG_AMU_AWARE
 	bool				stall_aware;
-	int				reduce_pct_of_stall;
-	int				max_stall_reduce_of_util;
+	u64				stall_reduce_pct;
 	int				report_policy;
-#endif
-
 	bool				multi_tl_enable;
 	struct multi_target_loads	multi_tl[UA_UTIL_SIZE];
-
-#ifdef CONFIG_OPLUS_UAG_SOFT_LIMIT
 	spinlock_t			soft_limit_freq_lock;
 	unsigned long			soft_limit_freq;
 	unsigned long			soft_limit_util;
 	bool				soft_limit_enable;
 	unsigned int			break_freq_margin;
-#endif
 };
 
 struct uag_gov_policy {
@@ -66,9 +53,7 @@ struct uag_gov_policy {
 
 	raw_spinlock_t		update_lock;	/* For shared policies */
 	u64			last_freq_update_time;
-	s64			min_rate_limit_ns;
-	s64			up_rate_delay_ns;
-	s64			down_rate_delay_ns;
+	s64			freq_update_delay_ns;
 	unsigned int		next_freq;
 	unsigned int		cached_raw_freq;
 	unsigned long		hispeed_util;
@@ -83,15 +68,15 @@ struct uag_gov_policy {
 	bool			work_in_progress;
 
 	bool			limits_changed;
-	bool			soft_limits_changed;
 	bool			need_freq_update;
 	bool			cobuck_boosted;
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_FRAME_BOOST)
 	unsigned int		flags;
+#endif
 	unsigned long		multi_util[UA_UTIL_SIZE];
 	unsigned int		multi_util_type;
 	unsigned int		fbg_gt_sys_cnt;
 	unsigned int		total_cnt;
-	u64			last_update;
 };
 
 static int init_flag[MAX_CLUSTERS];
@@ -101,7 +86,6 @@ extern u64 curr_frame_start;
 extern u64 prev_frame_start;
 #endif /* CONFIG_ARCH_MEDIATEK */
 
-#ifdef CONFIG_UAG_NONLINEAR_FREQ_CTL
 int init_opp_cap_info(struct proc_dir_entry *dir);
 void clear_opp_cap_info(void);
 
@@ -115,7 +99,6 @@ void nonlinear_map_util_freq(void *data, unsigned long util, unsigned long freq,
 		unsigned long cap, unsigned long *next_freq, struct cpufreq_policy *policy,
 		bool *need_freq_update);
 #endif /* CONFIG_ARCH_MEDIATEK */
-#endif /* CONFIG_UAG_NONLINEAR_FREQ_CTL */
 
 #ifdef CONFIG_OPLUS_FEATURE_TOUCH_BOOST
 int touch_boost_init(void);
@@ -130,9 +113,6 @@ void uag_update_util(void *data, unsigned long util, unsigned long freq,
 		bool *need_freq_update);
 #endif /* CONFIG_OPLUS_SYSTEM_KERNEL_QCOM */
 #endif /* CONFIG_OPLUS_UAG_USE_TL */
-#ifdef CONFIG_OPLUS_UAG_SOFT_LIMIT
-void set_soft_limit_freq(struct cpufreq_policy *policy, unsigned int soft_freq);
-#endif
 
 #include "stall_util_cal.h"
 

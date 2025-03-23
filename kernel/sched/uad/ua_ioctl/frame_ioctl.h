@@ -6,11 +6,6 @@
 #ifndef _FRAME_IOCTL_H_
 #define _FRAME_IOCTL_H_
 
-/* indicate this stune data is for restoring to def, value equals 'def' in ascii*/
-#define STUNE_DEF 0x444546
-/* indicate this stune data is from surfaceflinger's stune, value equals 'sf' in ascii */
-#define STUNE_SF 0x5346
-
 enum BoostStage {
 	BOOST_NONE = 0,
 	BOOST_ALL_STAGE = 1,
@@ -47,11 +42,6 @@ enum BoostStage {
 	BOOST_MSG_TRANS_START = 214,
 	BOOST_CLIENT_COMPOSITION = 215,
 	BOOST_SF_EXECUTE = 216,
-
-	/* for input method */
-	BOOST_MOVE_FG_IMS = 400,
-	BOOST_ADD_FRAME_TASK_IMS,
-	BOOST_INPUT_START,
 };
 
 enum ComposeStage     {
@@ -78,8 +68,6 @@ enum ofb_ctrl_cmd_id {
 	SET_TASK_TAGGING,
 	SET_SF_MSG_TRANS,
 	RELATED_SCHED_CONFIG,
-	BOOST_STUNE,
-	BOOST_STUNE_GPU,
 	CMD_ID_MAX
 };
 
@@ -88,33 +76,24 @@ struct ofb_ctrl_data {
 	pid_t tid;
 	pid_t hwtid1;
 	pid_t hwtid2;
+	int level;
+	int64_t frameNumber;
 	int stage;
-
+	int64_t sourceDelta;
+	int64_t targetDelta;
+	int64_t fpsNs;
 	int64_t vsyncNs;
+	int continuousdropframes;
+	int util_min;
+	int util_max;
+	int boost_freq;
+	int boost_migr;
+	int vutil_margin;
 	int capacity_need;
 	int related_width;
 	int related_depth;
 };
 
-struct ofb_stune_data {
-	int level;
-	int boost_freq;
-	int boost_migr;
-	int vutil_margin;
-	int util_frame_rate;
-	int util_min_threshold;
-	int util_min_obtain_view;
-	int util_min_timeout;
-	int ed_task_boost_mid_duration;
-	int ed_task_boost_mid_util;
-	int ed_task_boost_max_duration;
-	int ed_task_boost_max_util;
-	int ed_task_boost_timeout_duration;
-	int boost_sf_freq_nongpu;
-	int boost_sf_migr_nongpu;
-	int boost_sf_freq_gpu;
-	int boost_sf_migr_gpu;
-};
 
 #define OFB_MAGIC 0XDE
 #define CMD_ID_SET_FPS \
@@ -135,10 +114,6 @@ struct ofb_stune_data {
 	_IOWR(OFB_MAGIC, SET_SF_MSG_TRANS, struct ofb_ctrl_data)
 #define CMD_ID_RELATED_SCHED_CONFIG \
 	_IOWR(OFB_MAGIC, RELATED_SCHED_CONFIG, struct ofb_ctrl_data)
-#define CMD_ID_BOOST_STUNE \
-	_IOWR(OFB_MAGIC, BOOST_STUNE, struct ofb_stune_data)
-#define CMD_ID_BOOST_STUNE_GPU \
-	_IOWR(OFB_MAGIC, BOOST_STUNE_GPU, struct ofb_stune_data)
 
 enum ofb_ctrl_extra_cmd_id {
 	SET_TASK_PREFERED_CLUSTER = 1,

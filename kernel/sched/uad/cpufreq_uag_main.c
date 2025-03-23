@@ -4,7 +4,6 @@
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-#include <linux/kprobes.h>
 #ifdef CONFIG_ARCH_MEDIATEK
 #include <../kernel/sched/sched.h>
 #include <trace/hooks/cpuidle.h>
@@ -12,6 +11,12 @@
 #include "../../../drivers/misc/mediatek/sched/sugov/cpufreq.h"
 #else
 #include <../../../kernel/sched/walt/walt.h>
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_SUGOV_POWER_EFFIENCY)
+#include "../cpufreq_effiency/cpufreq_effiency.h"
+#endif
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_GKI_CPUFREQ_BOUNCING)
+#include "../cpufreq_bouncing/cpufreq_bouncing.h"
+#endif
 #endif /* CONFIG_ARCH_MEDIATEK */
 #include <linux/sched/cpufreq.h>
 #include <trace/events/power.h>
@@ -27,36 +32,28 @@
 
 #if IS_ENABLED(CONFIG_OPLUS_FEATURE_FRAME_BOOST)
 #include "../sched/frame_boost/frame_group.h"
-#include "../sched/frame_boost/frame_boost.h"
+#endif
+
+#if IS_ENABLED(CONFIG_OPLUS_OMRG)
+#include <linux/oplus_omrg.h>
 #endif
 
 #if IS_ENABLED(CONFIG_OPLUS_FEATURE_OCH)
 #include <linux/cpufreq_health.h>
 #endif
 
-#include "uag_systrace_debug.h"
-#if IS_ENABLED(CONFIG_OPLUS_CPUFREQ_IOWAIT_PROTECT)
-#include <../kernel/oplus_cpu/sched/eas_opt/oplus_iowait.h>
-#endif
-
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_VT_CAP)
-#include <../kernel/oplus_cpu/sched/eas_opt/oplus_cap.h>
-#endif
-
-#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
-typedef unsigned long (*stune_util_t)(int cpu, unsigned long other_util,
-		unsigned long util);
-stune_util_t _stune_util;
-#endif
-
+#ifdef CONFIG_OPLUS_MULTI_LV_TL
 #define DEFAULT_MULTI_TL_SYS 95
 static unsigned int default_target_loads_sys[] = {DEFAULT_MULTI_TL_SYS};
+#endif
 
 #define IOWAIT_BOOST_MIN        (SCHED_CAPACITY_SCALE / 8)
 
+#ifdef CONFIG_OPLUS_UAG_USE_TL
 /* Target load.  Lower values result in higher CPU speeds. */
 #define DEFAULT_TARGET_LOAD 80
 static unsigned int default_target_loads[] = {DEFAULT_TARGET_LOAD};
+#endif
 
 #ifdef CONFIG_OPLUS_UAG_SOFT_LIMIT
 #define DEFAULT_BREAK_FREQ_MARGIN 20
@@ -65,15 +62,15 @@ static unsigned int default_target_loads[] = {DEFAULT_TARGET_LOAD};
 struct proc_dir_entry *dir;
 
 struct uag_gov_cpu {
+	struct update_util_data	update_util;
+	unsigned int		prev_frame_loading;     /* prev frame idle time percentage */
+	u64			enter_idle;             /* cpu latest enter idle timestamp */
+	u64			prev_enter_ilde;        /* cpu last time enter idle timestamp */
+	u64			exit_idle;              /* cpu latest exit idle timestamp */
+	u64			prev_exit_idle;         /* cpu last time exit idle timestamp */
+	u64			idle_duration;          /* cpu current frame window in idle state time */
+	u64			prev_idle_duration;     /* cpu prev frame window in idle state time */
 	unsigned int		reasons;
-	unsigned int            prev_frame_loading;     /* prev frame idle time percentage */
-        u64                     enter_idle;             /* cpu latest enter idle timestamp */
-        u64                     prev_enter_ilde;        /* cpu last time enter idle timestamp */
-        u64                     exit_idle;              /* cpu latest exit idle timestamp */
-        u64                     prev_exit_idle;         /* cpu last time exit idle timestamp */
-        u64                     idle_duration;          /* cpu current frame window in idle state time */
-        u64                     prev_idle_duration;     /* cpu prev frame window in idle state time */
-	struct update_util_data	cb;
 	struct uag_gov_policy	*sg_policy;
 	unsigned int		cpu;
 
@@ -122,14 +119,6 @@ static bool uag_gov_should_update_freq(struct uag_gov_policy *sg_policy, u64 tim
 		return true;
 	}
 
-#ifdef CONFIG_OPLUS_UAG_SOFT_LIMIT
-	if (unlikely(sg_policy->soft_limits_changed)) {
-		sg_policy->soft_limits_changed = false;
-		sg_policy->need_freq_update = true;
-		return true;
-	}
-#endif /* CONFIG_OPLUS_UAG_SOFT_LIMIT */
-
 #if IS_ENABLED(CONFIG_OPLUS_FEATURE_FRAME_BOOST)
 	if ((sg_policy->flags & SCHED_CPUFREQ_DEF_FRAMEBOOST) || (sg_policy->flags & SCHED_CPUFREQ_EARLY_DET))
 		return true;
@@ -137,38 +126,12 @@ static bool uag_gov_should_update_freq(struct uag_gov_policy *sg_policy, u64 tim
 
 	delta_ns = time - sg_policy->last_freq_update_time;
 
-	return delta_ns >= READ_ONCE(sg_policy->min_rate_limit_ns);
-}
-
-static bool uag_up_down_rate_limit(struct uag_gov_policy *sg_policy, u64 time,
-								unsigned int next_freq)
-{
-	s64 delta_ns;
-
-	delta_ns = time - sg_policy->last_freq_update_time;
-
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_FRAME_BOOST)
-	if ((sg_policy->flags & SCHED_CPUFREQ_DEF_FRAMEBOOST) || (sg_policy->flags & SCHED_CPUFREQ_EARLY_DET))
-		return false;
-#endif
-
-	if (next_freq > sg_policy->next_freq &&
-		delta_ns < sg_policy->up_rate_delay_ns)
-		return true;
-
-	if (next_freq < sg_policy->next_freq &&
-		delta_ns < sg_policy->down_rate_delay_ns)
-		return true;
-
-	return false;
+	return delta_ns >= sg_policy->freq_update_delay_ns;
 }
 
 static bool uag_gov_update_next_freq(struct uag_gov_policy *sg_policy, u64 time,
 				   unsigned int next_freq)
 {
-	if (uag_up_down_rate_limit(sg_policy, time, next_freq))
-		return false;
-
 	if (!sg_policy->need_freq_update) {
 		if (sg_policy->next_freq == next_freq)
 			return false;
@@ -180,10 +143,14 @@ static bool uag_gov_update_next_freq(struct uag_gov_policy *sg_policy, u64 time,
 	return true;
 }
 
+
 static void uag_gov_fast_switch(struct uag_gov_policy *sg_policy, u64 time,
 			      unsigned int next_freq)
 {
 	if (uag_gov_update_next_freq(sg_policy, time, next_freq)) {
+#ifdef CONFIG_OPLUS_SYSTEM_KERNEL_QCOM
+		uag_track_cycles(sg_policy, sg_policy->policy->cur, time);
+#endif
 		cpufreq_driver_fast_switch(sg_policy->policy, next_freq);
 	}
 }
@@ -199,7 +166,6 @@ static void uag_gov_deferred_update(struct uag_gov_policy *sg_policy, u64 time,
 		irq_work_queue(&sg_policy->irq_work);
 	}
 }
-
 static inline unsigned int get_opp_capacity(struct cpufreq_policy *policy,
 					  int row)
 {
@@ -223,8 +189,6 @@ static inline int get_opp_count(struct cpufreq_policy *policy)
 	cpufreq_for_each_entry_idx(freq_pos, policy->freq_table, opp_nr);
 	return opp_nr;
 }
-
-
 static inline unsigned long uag_has_ua_util(struct uag_gov_policy *sg_policy)
 {
 	return sg_policy->multi_util[UA_UTIL_FBG];
@@ -259,11 +223,14 @@ static unsigned int util_to_targetload(
 	unsigned long flags;
 
 	spin_lock_irqsave(&tunables->target_loads_lock, flags);
+
+#ifdef CONFIG_OPLUS_MULTI_LV_TL
 	ret = uag_select_multi_tl(sg_policy, util);
 	if (ret) {
 		spin_unlock_irqrestore(&tunables->target_loads_lock, flags);
 		return ret;
 	}
+#endif
 
 	for (i = 0; i < tunables->ntarget_loads - 1 &&
 		     util >= tunables->util_loads[i+1]; i += 2) {
@@ -281,8 +248,9 @@ unsigned int find_util_l(struct uag_gov_policy *sg_policy, unsigned int util)
 
 	for (idx = sg_policy->len-1; idx >= 0; idx--) {
 		capacity = get_opp_capacity(sg_policy->policy, idx);
-		if (capacity >= util)
+		if (capacity >= util) {
 			return capacity;
+		}
 	}
 	return get_opp_capacity(sg_policy->policy, 0);
 }
@@ -295,15 +263,13 @@ unsigned int find_util_h(struct uag_gov_policy *sg_policy, unsigned int util)
 
 	for (idx = sg_policy->len-1; idx >= 0; idx--) {
 		capacity = get_opp_capacity(sg_policy->policy, idx);
-
-		if (capacity ==  util)
+		if (capacity ==  util) {
 			return util;
-
+		}
 		if (capacity < util) {
 			target_idx = idx;
 			continue;
 		}
-
 		if (target_idx == -1)
 			return capacity;
 		return get_opp_capacity(sg_policy->policy, target_idx);
@@ -318,8 +284,9 @@ unsigned int find_util_l(struct uag_gov_policy *sg_policy, unsigned int util)
 
 	for (idx = 0; idx < sg_policy->len; idx++) {
 		capacity = get_opp_capacity(sg_policy->policy, idx);
-		if (capacity >= util)
+		if (capacity >= util) {
 			return capacity;
+		}
 	}
 	return get_opp_capacity(sg_policy->policy, sg_policy->len-1);
 }
@@ -332,9 +299,9 @@ unsigned int find_util_h(struct uag_gov_policy *sg_policy, unsigned int util)
 
 	for (idx = 0; idx < sg_policy->len; idx++) {
 		capacity = get_opp_capacity(sg_policy->policy, idx);
-		if (capacity ==  util)
+		if (capacity ==  util) {
 			return util;
-
+		}
 		if (capacity < util) {
 			target_idx = idx;
 			continue;
@@ -384,6 +351,7 @@ unsigned int choose_util(struct uag_gov_policy *sg_policy,
 		 */
 
 		util = find_closest_util(sg_policy, (orig_util * 100 / tl), CPUFREQ_RELATION_L);
+	        //trace_choose_util(sg_policy->policy->cpu, util, prevutil, utilmax, utilmin, tl);
 		if (util > prevutil) {
 			/* The previous frequency is too low. */
 			utilmin = prevutil;
@@ -464,22 +432,9 @@ static unsigned int get_next_freq(struct uag_gov_policy *sg_policy,
 	nlopp_map_util_freq((void *)sg_policy, util, freq, policy->related_cpus, &next_freq);
 #endif
 
-	if (next_freq) {
-#ifdef CONFIG_OPLUS_SYSTEM_KERNEL_QCOM
-		struct walt_sched_cluster *cluster;
-		cluster = cpu_cluster(policy->cpu);
-		if (next_freq > fmax_cap[SMART_FMAX_CAP][cluster->id]) {
-			next_freq = fmax_cap[SMART_FMAX_CAP][cluster->id];
-		}
-		if (next_freq > fmax_cap[HIGH_PERF_CAP][cluster->id]) {
-			next_freq = fmax_cap[HIGH_PERF_CAP][cluster->id];
-		}
-		if (next_freq > fmax_cap[PARTIAL_HALT_CAP][cluster->id]) {
-			next_freq = fmax_cap[PARTIAL_HALT_CAP][cluster->id];
-		}
-#endif
+	if (next_freq)
 		freq = next_freq;
-	} else {
+	else {
 		freq = map_util_freq(util, freq, max);
 
 		if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)
@@ -513,35 +468,6 @@ static unsigned int get_next_freq(struct uag_gov_policy *sg_policy,
  * required to meet deadlines.
  */
 
-#ifdef CONFIG_ARCH_MEDIATEK
-static unsigned long uag_gov_get_util(struct uag_gov_cpu *sg_cpu)
-{
-	struct rq *rq = cpu_rq(sg_cpu->cpu);
-	unsigned long util = cpu_util_cfs(rq);
-	unsigned long max = arch_scale_cpu_capacity(sg_cpu->cpu);
-	struct util_rq util_rq_sugov;
-
-	sg_cpu->max = max;
-	sg_cpu->bw_dl = cpu_bw_dl(rq);
-/*
-	spin_lock(&per_cpu(cpufreq_idle_cpu_lock, sg_cpu->cpu));
-	if (per_cpu(cpufreq_idle_cpu, sg_cpu->cpu)) {
-		spin_unlock(&per_cpu(cpufreq_idle_cpu_lock, sg_cpu->cpu));
-		return 0;
-	}
-	spin_unlock(&per_cpu(cpufreq_idle_cpu_lock, sg_cpu->cpu));
-*/
-#ifdef CONFIG_OPLUS_UAG_AMU_AWARE
-	uag_adjust_util(sg_cpu->cpu, &util, sg_cpu->sg_policy);
-#endif
-
-	util_rq_sugov.util_cfs = cpu_util_cfs(rq);
-	util_rq_sugov.base = 1;
-	return mtk_cpu_util(sg_cpu->cpu, &util_rq_sugov, max, FREQUENCY_UTIL,
-							(struct task_struct *)UINTPTR_MAX,
-							0, SCHED_CAPACITY_SCALE);
-}
-#else
 static unsigned long uag_gov_get_util(struct uag_gov_cpu *sg_cpu)
 {
 	struct rq *rq = cpu_rq(sg_cpu->cpu);
@@ -550,24 +476,44 @@ static unsigned long uag_gov_get_util(struct uag_gov_cpu *sg_cpu)
 
 	sg_cpu->max = max;
 	sg_cpu->reasons = 0;
-	util = effective_cpu_util(sg_cpu->cpu, cpu_util_cfs(sg_cpu->cpu), max,
-					  NULL);
+	util = cpu_util_cfs(sg_cpu->cpu);
 	sg_cpu->bw_dl = cpu_bw_dl(rq);
 
-#ifdef CONFIG_OPLUS_UAG_AMU_AWARE
-	uag_adjust_util(sg_cpu->cpu, &util, sg_cpu->sg_policy);
-#endif
-
-#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
-	if (_stune_util)
-		util = (*_stune_util)(sg_cpu->cpu, 0, util);
-#endif
 	return uclamp_rq_util_with(rq, util, NULL);
 }
 
+/*static unsigned long freq_to_util(struct uag_gov_policy *sg_policy,
+				  unsigned int freq)
+{
+	int opp;
 
-
+	if (freq == 0)
 #ifdef CONFIG_ARCH_MEDIATEK
+		opp = sg_policy->len - 1;
+#else
+		opp = 0;
+#endif
+	else {
+		opp = cpufreq_frequency_table_get_index(sg_policy->policy, freq);
+		if (opp < 0) {
+			pr_err("get opp idx failed! cpu = %d freq = %d", sg_policy->policy->cpu, freq);
+			return 0;
+		}
+	}
+
+	return pd_get_opp_capacity(sg_policy->policy->cpu, opp);
+}*/
+
+static inline unsigned long target_util(struct uag_gov_policy *sg_policy,
+				  unsigned int freq)
+{
+	unsigned long util;
+	util =   effective_cpu_util(sg_policy->policy->cpu, cpu_util_cfs(sg_policy->policy->cpu),
+					  FREQUENCY_UTIL, NULL);
+	return util;
+}
+
+/*#ifdef CONFIG_ARCH_MEDIATEK
 static unsigned int freq2util(struct uag_gov_policy *sg_policy, unsigned int freq)
 {
 	int idx;
@@ -588,8 +534,9 @@ static unsigned int freq2util(struct uag_gov_policy *sg_policy, unsigned int fre
 		opp_freq = sg_policy->policy->freq_table[idx].frequency;
 #endif
 
-		if (freq <= opp_freq)
+		if (freq <= opp_freq) {
 			return capacity;
+		}
 	}
 	return get_opp_capacity(sg_policy->policy, 0);
 }
@@ -598,6 +545,7 @@ static unsigned int freq2util(struct uag_gov_policy *sg_policy, unsigned int fre
 {
 	int idx;
 	unsigned int capacity, opp_freq;
+
 #ifdef CONFIG_MTK_TINYSYS_SSPM_SUPPORT
 	int cpu = sg_policy->policy->cpu;
 	int cid = arch_get_cluster_id(cpu);
@@ -613,47 +561,14 @@ static unsigned int freq2util(struct uag_gov_policy *sg_policy, unsigned int fre
 		opp_freq = sg_policy->policy->freq_table[idx].frequency;
 #endif
 
-		if (freq <= opp_freq)
+		if (freq <= opp_freq) {
 			return capacity;
+		}
 	}
 	return get_opp_capacity(sg_policy->policy, sg_policy->len-1);
 }
-#endif /* CONFIG_ARCH_MEDIATEK */
-
-#ifdef CONFIG_OPLUS_UAG_SOFT_LIMIT
-void set_soft_limit_freq(struct cpufreq_policy *policy, unsigned int soft_freq)
-{
-	struct uag_gov_policy *sg_policy = policy->governor_data;
-	struct uag_gov_tunables *tunables;
-	unsigned long flags;
-	struct cpumask *cpus;
-	unsigned int first_cpu;
-	int cluster_id;
-
-	soft_freq = min(soft_freq, policy->cpuinfo.max_freq);
-	cpus = policy->related_cpus;
-	first_cpu = cpumask_first(cpus);
-	cluster_id = topology_cluster_id(first_cpu);
-
-	if (cluster_id >= MAX_CLUSTERS || cluster_id < 0)
-		return;
-
-	if (init_flag[cluster_id] == 0)
-		return;
-
-	tunables = sg_policy->tunables;
-	spin_lock_irqsave(&tunables->soft_limit_freq_lock, flags);
-	tunables->soft_limit_freq = soft_freq;
-	tunables->soft_limit_util = freq2util(sg_policy, soft_freq);
-	spin_unlock_irqrestore(&tunables->soft_limit_freq_lock, flags);
-	trace_set_soft_limit_freq(first_cpu, soft_freq, tunables->soft_limit_util);
-
-	topology_update_thermal_pressure(cpus, soft_freq);
-
-	sg_policy->soft_limits_changed = true;
-}
-EXPORT_SYMBOL(set_soft_limit_freq);
-#endif /* CONFIG_OPLUS_UAG_SOFT_LIMIT */
+#endif*/
+/* CONFIG_ARCH_MEDIATEK */
 
 static void uag_gov_util_adjust(struct uag_gov_cpu *sg_cpu, unsigned long cpu_util,
 				unsigned long *util, unsigned long *max)
@@ -668,27 +583,17 @@ static void uag_gov_util_adjust(struct uag_gov_cpu *sg_cpu, unsigned long cpu_ut
 
 #if IS_ENABLED(CONFIG_OPLUS_FEATURE_FRAME_BOOST)
 	if (sg_policy->flags & SCHED_CPUFREQ_EARLY_DET) {
-		trace_ed_task_boost(cpu_util, *util, ed_task_boost_type, stune_boost[BOOST_ED_TASK_MID_UTIL], stune_boost[BOOST_ED_TASK_MAX_UTIL]);
+		trace_ed_task_boost(cpu_util, *util, ed_task_boost_type, ed_task_boost_mid_util, ed_task_boost_max_util);
 		if (ed_task_boost_type == ED_TASK_BOOST_MID)
-			cpu_util = cpu_util < stune_boost[BOOST_ED_TASK_MID_UTIL] ? stune_boost[BOOST_ED_TASK_MID_UTIL] : cpu_util;
+			cpu_util = cpu_util < ed_task_boost_mid_util ? ed_task_boost_mid_util : cpu_util;
 		else if (ed_task_boost_type == ED_TASK_BOOST_MAX)
-			cpu_util = cpu_util < stune_boost[BOOST_ED_TASK_MAX_UTIL] ? stune_boost[BOOST_ED_TASK_MAX_UTIL] : cpu_util;
+			cpu_util = cpu_util < ed_task_boost_max_util ? ed_task_boost_max_util : cpu_util;
 		*util = max(*util, cpu_util);
 	}
 #endif
 }
 
 
-static inline void max_and_reason(unsigned long *cur_util, unsigned long boost_util,
-		struct uag_gov_cpu *sg_cpu, unsigned int reason)
-{
-	if (boost_util && boost_util >= *cur_util) {
-		*cur_util = boost_util;
-		sg_cpu->reasons = reason;
-	}
-}
-
-#define NL_RATIO 75
 
 /**
  * uag_gov_iowait_reset() - Reset the IO boost status of a CPU.
@@ -705,19 +610,10 @@ static bool uag_gov_iowait_reset(struct uag_gov_cpu *sg_cpu, u64 time,
 			       bool set_iowait_boost)
 {
 	s64 delta_ns = time - sg_cpu->last_update;
-#if IS_ENABLED(CONFIG_OPLUS_CPUFREQ_IOWAIT_PROTECT)
-	unsigned int ticks = TICK_NSEC;
 
-	if (sysctl_oplus_iowait_boost_enabled && sysctl_iowait_reset_ticks)
-		ticks = sysctl_iowait_reset_ticks * TICK_NSEC;
-
-	if (delta_ns <= ticks)
-		return false;
-#else
 	/* Reset boost only if a tick has elapsed since last request */
 	if (delta_ns <= TICK_NSEC)
 		return false;
-#endif
 
 	sg_cpu->iowait_boost = set_iowait_boost ? IOWAIT_BOOST_MIN : 0;
 	sg_cpu->iowait_boost_pending = set_iowait_boost;
@@ -742,15 +638,7 @@ static bool uag_gov_iowait_reset(struct uag_gov_cpu *sg_cpu, u64 time,
 static void uag_gov_iowait_boost(struct uag_gov_cpu *sg_cpu, u64 time,
 			       unsigned int flags)
 {
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_VT_CAP)
-#ifdef CONFIG_OPLUS_SYSTEM_KERNEL_QCOM
-	bool set_iowait_boost = flags & WALT_CPUFREQ_IOWAIT;
-#else
 	bool set_iowait_boost = flags & SCHED_CPUFREQ_IOWAIT;
-#endif
-#else
-	bool set_iowait_boost = flags & SCHED_CPUFREQ_IOWAIT;
-#endif
 
 	/* Reset boost if the CPU appears to have been idle enough */
 	if (sg_cpu->iowait_boost &&
@@ -800,9 +688,6 @@ static unsigned long uag_gov_iowait_apply(struct uag_gov_cpu *sg_cpu, u64 time,
 					unsigned long util, unsigned long max)
 {
 	unsigned long boost;
-#if IS_ENABLED(CONFIG_OPLUS_CPUFREQ_IOWAIT_PROTECT)
-	struct uag_gov_policy *sg_policy = sg_cpu->sg_policy;
-#endif
 
 	/* No boost currently required */
 	if (!sg_cpu->iowait_boost)
@@ -812,13 +697,7 @@ static unsigned long uag_gov_iowait_apply(struct uag_gov_cpu *sg_cpu, u64 time,
 	if (uag_gov_iowait_reset(sg_cpu, time, false))
 		return util;
 
-#if IS_ENABLED(CONFIG_OPLUS_CPUFREQ_IOWAIT_PROTECT)
-	if (!sg_cpu->iowait_boost_pending &&
-			(!sysctl_oplus_iowait_boost_enabled || !sysctl_iowait_apply_ticks ||
-			 (time - sg_policy->last_update > (sysctl_iowait_apply_ticks * TICK_NSEC)))) {
-#else
 	if (!sg_cpu->iowait_boost_pending) {
-#endif
 		/*
 		 * No boost pending; reduce the boost value.
 		 */
@@ -859,9 +738,8 @@ static unsigned int uag_gov_get_final_freq(struct uag_gov_cpu *sg_cpu, struct ua
 {
 	struct cpufreq_policy cobuck_policy;
 	struct uag_gov_policy *cobuck_sg_policy;
-	unsigned int cobuck_volt, cobuck_cid, cobuck_first_cpu;
-	unsigned int curr_first_cpu, curr_cid, curr_volt, opp_freq, opp_volt;
-	unsigned int lowest_volt_diff = 0;
+	unsigned int cobuck_cid, cobuck_first_cpu;
+	unsigned int opp_freq, curr_cid,curr_first_cpu;
 	unsigned int final_freq = next_freq;
 	int cobuck_cpu, opp;
 
@@ -889,34 +767,19 @@ static unsigned int uag_gov_get_final_freq(struct uag_gov_cpu *sg_cpu, struct ua
 
 	if (!cobuck_sg_policy)
 		return next_freq;
-
-	cobuck_first_cpu = cpumask_first(cobuck_policy.related_cpus);
-	cobuck_cid = topology_cluster_id(cobuck_first_cpu);
-	cobuck_volt = freq_to_voltage(cobuck_cid, cobuck_policy.cur);
-
-	curr_first_cpu = cpumask_first(sg_policy->policy->related_cpus);
-	curr_cid = topology_cluster_id(curr_first_cpu);
-	curr_volt = freq_to_voltage(curr_cid, next_freq);
-
-	lowest_volt_diff = abs(curr_volt - cobuck_volt);
 	opp = cpufreq_frequency_table_get_index(sg_policy->policy, next_freq);
 	if (opp < 0)
 		return next_freq;
-#ifdef CONFIG_ARCH_MEDIATEK
 	for (; opp >= 0; opp--) {
-#else
-	for (; opp <= sg_policy->len - 1; opp++) {
-#endif
 #ifdef CONFIG_UAG_NONLINEAR_FREQ_CTL
 		opp_freq = pd_get_cpu_freq(sg_policy->policy->cpu, opp);
 #else
 		opp_freq = sg_policy->policy->freq_table[opp].frequency;
 #endif
-		opp_volt = freq_to_voltage(curr_cid, opp_freq);
-		if (lowest_volt_diff >= abs(opp_volt - cobuck_volt)) {
-			lowest_volt_diff = abs(opp_volt - cobuck_volt);
-			final_freq = opp_freq;
-		}
+		cobuck_first_cpu = cpumask_first(cobuck_policy.related_cpus);
+		curr_first_cpu = cpumask_first(sg_policy->policy->related_cpus);
+		cobuck_cid = topology_physical_package_id(cobuck_first_cpu);
+		curr_cid =  topology_physical_package_id(curr_first_cpu);
 	}
 	if (final_freq <= next_freq) {
 		sg_policy->cobuck_boosted = 0;
@@ -924,9 +787,9 @@ static unsigned int uag_gov_get_final_freq(struct uag_gov_cpu *sg_cpu, struct ua
 	} else if (cobuck_sg_policy->cobuck_boosted) {
 		sg_policy->cobuck_boosted = 0;
 		return next_freq;
-	}
+	} else
+		sg_policy->cobuck_boosted = 1;
 
-	sg_policy->cobuck_boosted = 1;
 	return final_freq;
 }
 
@@ -944,23 +807,14 @@ static inline unsigned long uag_multi_util_max(struct uag_gov_policy *sg_policy)
 	return max;
 }
 #endif
-static void uag_gov_update_single(struct update_util_data  *hook, u64 time,
+
+static void uag_gov_update_single(struct update_util_data *hook, u64 time,
 				unsigned int flags)
 {
-	struct uag_gov_cpu *sg_cpu = container_of(hook, struct uag_gov_cpu, cb);
+	struct uag_gov_cpu *sg_cpu = container_of(hook, struct uag_gov_cpu, update_util);
 	struct uag_gov_policy *sg_policy = sg_cpu->sg_policy;
 	unsigned long util, max;
 	unsigned int next_f;
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_VT_CAP)
-	struct cpufreq_policy *policy = sg_policy->policy;
-	int util_thresh = 0;
-	unsigned int avg_nr_running = 1;
-	int cluster_id = topology_physical_package_id(cpumask_first(policy->cpus));
-	unsigned long util_orig;
-#endif
-#if IS_ENABLED(CONFIG_OPLUS_CPUFREQ_IOWAIT_PROTECT)
-	unsigned long util_bak;
-#endif
 
 #if IS_ENABLED(CONFIG_OPLUS_FEATURE_FRAME_BOOST)
 	unsigned long irq_flags = 0;
@@ -970,9 +824,6 @@ static void uag_gov_update_single(struct update_util_data  *hook, u64 time,
 
 	raw_spin_lock_irqsave(&sg_policy->update_lock, irq_flags);
 #else
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_VT_CAP)
-	struct rq *rq = cpu_rq(sg_cpu->cpu);
-#endif
 	raw_spin_lock(&sg_policy->update_lock);
 #endif
 	uag_gov_iowait_boost(sg_cpu, time, flags);
@@ -993,7 +844,7 @@ static void uag_gov_update_single(struct update_util_data  *hook, u64 time,
 	}
 
 #if IS_ENABLED(CONFIG_OPLUS_FEATURE_FRAME_BOOST)
-	if (!(sg_policy->flags & SCHED_CPUFREQ_EARLY_DET) && curr && fbg_is_ed_task(curr, fbg_wall_clock))
+	if (curr && fbg_is_ed_task(curr, fbg_wall_clock))
 		sg_policy->flags |= SCHED_CPUFREQ_EARLY_DET;
 #endif
 
@@ -1003,17 +854,8 @@ static void uag_gov_update_single(struct update_util_data  *hook, u64 time,
 	util = uag_gov_get_util(sg_cpu);
 	max = sg_cpu->max;
 	uag_gov_util_adjust(sg_cpu, util, &util, &max);
-#endif /* CONFIG_ARCH_MEDIATEK */
 
-#if IS_ENABLED(CONFIG_OPLUS_CPUFREQ_IOWAIT_PROTECT)
-	util_bak = util;
 	util = uag_gov_iowait_apply(sg_cpu, time, util, max);
-	if (unlikely(eas_opt_debug_enable))
-	printk("[eas_opt]: enable_iowait_boost=%d, cpu:%d, max:%d, cpu->util:%d,iowait_util:%d\n",
-				sysctl_oplus_iowait_boost_enabled, sg_cpu->cpu, max, util_bak, util);
-#else
-	util = uag_gov_iowait_apply(sg_cpu, time, util, max);
-#endif
 #if IS_ENABLED(CONFIG_OPLUS_FEATURE_FRAME_BOOST)
 #ifdef CONFIG_OPLUS_MULTI_LV_TL
 	sg_policy->multi_util[UA_UTIL_SYS] = util;
@@ -1028,24 +870,6 @@ static void uag_gov_update_single(struct update_util_data  *hook, u64 time,
 	fbg_freq_policy_util(sg_cpu->sg_policy->flags, sg_policy->policy->cpus, &util);
 #endif
 #endif
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_VT_CAP)
-	if (eas_opt_enable && (util_thresh_percent[cluster_id] != 100)) {
-		util_thresh = max * util_thresh_cvt[cluster_id] >> SCHED_CAPACITY_SHIFT;
-		avg_nr_running = rq->nr_running;
-		util_orig = util;
-		util = (util_thresh < util) ?
-			(util_thresh + ((avg_nr_running * (util-util_thresh) * nr_oplus_cap_multiple[cluster_id]) >> SCHED_CAPACITY_SHIFT)) : util;
-#ifdef CONFIG_OPLUS_MULTI_LV_TL
-		sg_policy->multi_util[UA_UTIL_FBG] = min_t(int, sg_policy->multi_util[UA_UTIL_FBG], util);
-		sg_policy->multi_util[UA_UTIL_SYS] = min_t(int, sg_policy->multi_util[UA_UTIL_SYS], util);
-#endif
-		if (unlikely(eas_opt_debug_enable))
-			trace_printk("[eas_opt]: cluster_id: %d, capacity: %d, util_thresh: %d, util_orig: %d, "
-					"util: %d, avg_nr_running: %d, oplus_cap_multiple: %d,nr_oplus_cap_multiple: %d, util_thresh: %d\n",
-					cluster_id, max, util_thresh, util_orig, util, avg_nr_running,
-					oplus_cap_multiple[cluster_id], nr_oplus_cap_multiple[cluster_id], util_thresh_percent[cluster_id]);
-	}
-#endif
 	next_f = get_next_freq(sg_policy, util, max);
 
 	/*cobuck check*/
@@ -1059,9 +883,9 @@ static void uag_gov_update_single(struct update_util_data  *hook, u64 time,
 	 * concurrently on two different CPUs for the same target and it is not
 	 * necessary to acquire the lock in the fast switch case.
 	 */
-	if (sg_policy->policy->fast_switch_enabled)
+	if (sg_policy->policy->fast_switch_enabled) {
 		uag_gov_fast_switch(sg_policy, time, next_f);
-	else
+	} else
 		uag_gov_deferred_update(sg_policy, time, next_f);
 
 #if IS_ENABLED(CONFIG_OPLUS_FEATURE_FRAME_BOOST)
@@ -1077,14 +901,8 @@ static unsigned int uag_gov_next_freq_shared(struct uag_gov_cpu *sg_cpu, u64 tim
 	struct cpufreq_policy *policy = sg_policy->policy;
 	unsigned long util = 0, max = 1;
 	unsigned int j;
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_VT_CAP)
-	int util_thresh = 0;
-	unsigned int avg_nr_running = 1;
-	unsigned int count_cpu = 0;
-	int cluster_id = topology_physical_package_id(cpumask_first(policy->cpus));
-	unsigned long util_orig;
-#endif
 #if IS_ENABLED(CONFIG_OPLUS_FEATURE_FRAME_BOOST)
+	bool is_ed_task = false;
 	u64 fbg_wall_clock = fbg_ktime_get_ns();
 #endif
 
@@ -1095,32 +913,20 @@ static unsigned int uag_gov_next_freq_shared(struct uag_gov_cpu *sg_cpu, u64 tim
 		struct rq *rq = cpu_rq(j);
 		struct task_struct *curr = rq->curr;
 
-		if (!(sg_policy->flags & SCHED_CPUFREQ_EARLY_DET) && curr && fbg_is_ed_task(curr, fbg_wall_clock))
+		if (!is_ed_task && curr && fbg_is_ed_task(curr, fbg_wall_clock)) {
 			sg_policy->flags |= SCHED_CPUFREQ_EARLY_DET;
-#else
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_VT_CAP)
-		struct rq *rq = cpu_rq(j);
-#endif
-#endif /* CONFIG_ARCH_QCOM */
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_VT_CAP)
-		avg_nr_running += rq->nr_running;
-		count_cpu++;
+			is_ed_task = true;
+		}
 #endif
 
 		j_util = j_sg_cpu->util;
 		j_max = j_sg_cpu->max;
 		j_util = uag_gov_iowait_apply(j_sg_cpu, time, j_util, j_max);
-#if IS_ENABLED(CONFIG_OPLUS_CPUFREQ_IOWAIT_PROTECT)
-		if (unlikely(eas_opt_debug_enable))
-			trace_printk("[eas_opt]: enable_iowait_boost=%d, cpu:%d, max:%d, cpu->util:%d,iowait_util:%d\n",
-					sysctl_oplus_iowait_boost_enabled, j_sg_cpu->cpu, j_sg_cpu->max, j_sg_cpu->util, j_util);
-#endif
+
 		if (j_util * max > j_max * util) {
 			util = j_util;
 			max = j_max;
 		}
-
-
 		uag_gov_util_adjust(j_sg_cpu, j_util, &util, &max);
 	}
 
@@ -1138,22 +944,6 @@ static unsigned int uag_gov_next_freq_shared(struct uag_gov_cpu *sg_cpu, u64 tim
 	fbg_freq_policy_util(sg_policy->flags, policy->cpus, &util);
 #endif
 #endif
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_VT_CAP)
-	if (eas_opt_enable && (util_thresh_percent[cluster_id] != 100) && count_cpu) {
-		util_thresh = max * util_thresh_cvt[cluster_id] >> SCHED_CAPACITY_SHIFT;
-		avg_nr_running = mult_frac(avg_nr_running, 1, count_cpu);
-		util_orig = util;
-		util = (util_thresh < util) ?
-			(util_thresh + ((avg_nr_running * (util-util_thresh) * nr_oplus_cap_multiple[cluster_id]) >> SCHED_CAPACITY_SHIFT)) : util;
-#ifdef CONFIG_OPLUS_MULTI_LV_TL
-		sg_policy->multi_util[UA_UTIL_FBG] = min_t(int, sg_policy->multi_util[UA_UTIL_FBG], util);
-		sg_policy->multi_util[UA_UTIL_SYS] = min_t(int, sg_policy->multi_util[UA_UTIL_SYS], util);
-#endif
-		if (unlikely(eas_opt_debug_enable))
-			trace_printk("[eas_opt]: cluster_id: %d, util_orig: %d, util: %d, avg_nr_running: %d, oplus_cap_multiple: %d,nr_oplus_cap_multiple: %d, util_thresh: %d\n",
-			cluster_id, util_orig, util, avg_nr_running, oplus_cap_multiple[cluster_id], nr_oplus_cap_multiple[cluster_id], util_thresh_percent[cluster_id]);
-	}
-#endif
 
 	return get_next_freq(sg_policy, util, max);
 }
@@ -1161,12 +951,11 @@ static unsigned int uag_gov_next_freq_shared(struct uag_gov_cpu *sg_cpu, u64 tim
 static void
 uag_gov_update_shared(struct update_util_data *hook, u64 time, unsigned int flags)
 {
-	struct uag_gov_cpu *sg_cpu = container_of(hook, struct uag_gov_cpu, cb);
+	struct uag_gov_cpu *sg_cpu = container_of(hook, struct uag_gov_cpu, update_util);
 	struct uag_gov_policy *sg_policy = sg_cpu->sg_policy;
 	unsigned int next_f;
 #if IS_ENABLED(CONFIG_OPLUS_FEATURE_FRAME_BOOST)
 	unsigned long irq_flags;
-
 	raw_spin_lock_irqsave(&sg_policy->update_lock, irq_flags);
 #else
 	raw_spin_lock(&sg_policy->update_lock);
@@ -1187,11 +976,7 @@ uag_gov_update_shared(struct update_util_data *hook, u64 time, unsigned int flag
 					   sg_policy->policy->cur);
 #endif /* CONFIG_OPLUS_SYSTEM_KERNEL_QCOM */
 
-	if (uag_gov_should_update_freq(sg_policy, time)
-#ifdef CONFIG_OPLUS_SYSTEM_KERNEL_QCOM
-		&& !(flags & WALT_CPUFREQ_CONTINUE)
-#endif
-) {
+	if (uag_gov_should_update_freq(sg_policy, time)) {
 #ifdef CONFIG_OPLUS_UAG_AMU_AWARE
 		uag_update_counter(sg_policy);
 #endif
@@ -1202,9 +987,6 @@ uag_gov_update_shared(struct update_util_data *hook, u64 time, unsigned int flag
 
 #ifdef CONFIG_OPLUS_SYSTEM_KERNEL_QCOM
 		next_f = cpufreq_driver_resolve_freq(sg_policy->policy, next_f);
-#endif
-#if IS_ENABLED(CONFIG_OPLUS_CPUFREQ_IOWAIT_PROTECT)
-		sg_policy->last_update = time;
 #endif
 
 		if (sg_policy->policy->fast_switch_enabled)
@@ -1240,7 +1022,7 @@ static void uag_gov_work(struct kthread_work *work)
 	freq = sg_policy->next_freq;
 #ifdef CONFIG_OPLUS_SYSTEM_KERNEL_QCOM
 	uag_track_cycles(sg_policy, sg_policy->policy->cur,
-			   walt_sched_clock());
+			   ktime_get_ns());
 #endif
 	sg_policy->work_in_progress = false;
 	raw_spin_unlock_irqrestore(&sg_policy->update_lock, flags);
@@ -1251,7 +1033,7 @@ static void uag_gov_work(struct kthread_work *work)
 }
 bool check_freq_update_for_time_uag(struct update_util_data *hook, u64 time)
 {
-	struct uag_gov_cpu *sg_cpu = container_of(hook, struct uag_gov_cpu,cb);
+	struct uag_gov_cpu *sg_cpu = container_of(hook, struct uag_gov_cpu, update_util);
 
 	return sg_cpu->last_update == time;
 }
@@ -1276,7 +1058,30 @@ static inline struct uag_gov_tunables *to_uag_gov_tunables(struct gov_attr_set *
 	return container_of(attr_set, struct uag_gov_tunables, attr_set);
 }
 
-static DEFINE_MUTEX(min_rate_lock);
+static ssize_t rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
+{
+	struct uag_gov_tunables *tunables = to_uag_gov_tunables(attr_set);
+
+	return sprintf(buf, "%u\n", tunables->rate_limit_us);
+}
+
+static ssize_t
+rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf, size_t count)
+{
+	struct uag_gov_tunables *tunables = to_uag_gov_tunables(attr_set);
+	struct uag_gov_policy *sg_policy;
+	unsigned int rate_limit_us;
+
+	if (kstrtouint(buf, 10, &rate_limit_us))
+		return -EINVAL;
+
+	tunables->rate_limit_us = rate_limit_us;
+
+	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
+		sg_policy->freq_update_delay_ns = rate_limit_us * NSEC_PER_USEC;
+
+	return count;
+}
 
 #ifdef CONFIG_OPLUS_UAG_AMU_AWARE
 static ssize_t stall_aware_show(struct gov_attr_set *attr_set, char *buf)
@@ -1299,11 +1104,24 @@ stall_aware_store(struct gov_attr_set *attr_set, const char *buf, size_t count)
 	return count;
 }
 
-static ssize_t reduce_pct_of_stall_show(struct gov_attr_set *attr_set, char *buf)
+static ssize_t stall_reduce_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
 	struct uag_gov_tunables *tunables = to_uag_gov_tunables(attr_set);
 
-	return sprintf(buf, "%llu\n", tunables->reduce_pct_of_stall);
+	return sprintf(buf, "%llu\n", tunables->stall_reduce_pct);
+}
+
+static ssize_t
+stall_reduce_pct_store(struct gov_attr_set *attr_set, const char *buf, size_t count)
+{
+	struct uag_gov_tunables *tunables = to_uag_gov_tunables(attr_set);
+	int stall_reduce_pct;
+
+	if (kstrtouint(buf, 10, &stall_reduce_pct))
+		return -EINVAL;
+
+	tunables->stall_reduce_pct = stall_reduce_pct;
+	return count;
 }
 
 static ssize_t report_policy_show(struct gov_attr_set *attr_set, char *buf)
@@ -1325,47 +1143,25 @@ report_policy_store(struct gov_attr_set *attr_set, const char *buf, size_t count
 	tunables->report_policy = report_policy;
 	return count;
 }
-
-static ssize_t
-reduce_pct_of_stall_store(struct gov_attr_set *attr_set, const char *buf, size_t count)
-{
-	struct uag_gov_tunables *tunables = to_uag_gov_tunables(attr_set);
-	int reduce_pct_of_stall;
-
-	if (kstrtouint(buf, 10, &reduce_pct_of_stall))
-		return -EINVAL;
-
-	if (reduce_pct_of_stall < 0 || reduce_pct_of_stall > 100)
-		return -EINVAL;
-
-	tunables->reduce_pct_of_stall = reduce_pct_of_stall;
-	return count;
-}
-
-static ssize_t max_stall_reduce_of_util_show(struct gov_attr_set *attr_set, char *buf)
-{
-	struct uag_gov_tunables *tunables = to_uag_gov_tunables(attr_set);
-
-	return sprintf(buf, "%d\n", tunables->max_stall_reduce_of_util);
-}
-
-static ssize_t
-max_stall_reduce_of_util_store(struct gov_attr_set *attr_set, const char *buf, size_t count)
-{
-	struct uag_gov_tunables *tunables = to_uag_gov_tunables(attr_set);
-	int max_stall_reduce_of_util;
-
-	if (kstrtoint(buf, 10, &max_stall_reduce_of_util))
-		return -EINVAL;
-
-	if (max_stall_reduce_of_util < 0 || max_stall_reduce_of_util > 100)
-		return -EINVAL;
-
-	tunables->max_stall_reduce_of_util = max_stall_reduce_of_util;
-	return count;
-}
 #endif /* CONFIG_OPLUS_UAG_AMU_AWARE */
 
+#ifdef CONFIG_OPLUS_UAG_USE_TL
+static ssize_t target_loads_show(struct gov_attr_set *attr_set, char *buf)
+{
+	struct uag_gov_tunables *tunables = to_uag_gov_tunables(attr_set);
+	int i;
+	ssize_t ret = 0;
+	unsigned long flags;
+
+	spin_lock_irqsave(&tunables->target_loads_lock, flags);
+	for (i = 0; i < tunables->ntarget_loads; i++)
+		ret += snprintf(buf + ret, PAGE_SIZE - ret - 1, "%u%s", tunables->target_loads[i],
+			i & 0x1 ? ":" : " ");
+
+	snprintf(buf + ret - 1, PAGE_SIZE - ret - 1, "\n");
+	spin_unlock_irqrestore(&tunables->target_loads_lock, flags);
+	return ret;
+}
 
 static unsigned int *get_tokenized_data(const char *buf, int *num_tokens)
 {
@@ -1417,6 +1213,7 @@ err:
 	return ERR_PTR(err);
 }
 
+#ifdef CONFIG_OPLUS_MULTI_LV_TL
 static inline void uag_reg_multi_tl_fbg(struct uag_gov_tunables *tunables)
 {
 	struct multi_target_loads *multi_tl = &tunables->multi_tl[UA_UTIL_FBG];
@@ -1425,6 +1222,7 @@ static inline void uag_reg_multi_tl_fbg(struct uag_gov_tunables *tunables)
 	multi_tl->util_loads = tunables->util_loads;
 	multi_tl->ntarget_loads = tunables->ntarget_loads;
 }
+#endif
 
 static ssize_t target_loads_store(struct gov_attr_set *attr_set, const char *buf,
 					size_t count)
@@ -1455,8 +1253,9 @@ static ssize_t target_loads_store(struct gov_attr_set *attr_set, const char *buf
 
 	memcpy(new_util_loads, new_target_loads, sizeof(unsigned int) * ntokens);
 
-	for (i = 0; i < ntokens - 1; i += 2)
+	for (i = 0; i < ntokens - 1; i += 2) {
 		new_util_loads[i+1] = freq2util(sg_policy, new_target_loads[i+1]);
+	}
 
 	spin_lock_irqsave(&tunables->target_loads_lock, flags);
 	if (tunables->target_loads != default_target_loads)
@@ -1468,7 +1267,9 @@ static ssize_t target_loads_store(struct gov_attr_set *attr_set, const char *buf
 	tunables->ntarget_loads = ntokens;
 	tunables->util_loads = new_util_loads;
 
+#ifdef CONFIG_OPLUS_MULTI_LV_TL
 	uag_reg_multi_tl_fbg(tunables);
+#endif
 	spin_unlock_irqrestore(&tunables->target_loads_lock, flags);
 
 	return count;
@@ -1503,7 +1304,7 @@ ssize_t set_sugov_tl_uag(unsigned int cpu, char *buf)
 	return target_loads_store(attr_set, buf, count);
 }
 EXPORT_SYMBOL_GPL(set_sugov_tl_uag);
-
+#endif
 
 static ssize_t hispeed_load_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -1538,6 +1339,7 @@ static ssize_t hispeed_freq_store(struct gov_attr_set *attr_set,
 	struct uag_gov_tunables *tunables = to_uag_gov_tunables(attr_set);
 	unsigned int val;
 	struct uag_gov_policy *sg_policy;
+	unsigned long hs_util;
 	unsigned long flags;
 
 	if (kstrtouint(buf, 10, &val))
@@ -1546,6 +1348,9 @@ static ssize_t hispeed_freq_store(struct gov_attr_set *attr_set,
 	tunables->hispeed_freq = val;
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook) {
 		raw_spin_lock_irqsave(&sg_policy->update_lock, flags);
+		hs_util = target_util(sg_policy,
+					sg_policy->tunables->hispeed_freq);
+		sg_policy->hispeed_util = hs_util;
 		raw_spin_unlock_irqrestore(&sg_policy->update_lock, flags);
 	}
 
@@ -1575,6 +1380,7 @@ static ssize_t soft_limit_freq_store(struct gov_attr_set *attr_set, const char *
 	unsigned int soft_freq;
 	unsigned long flags;
 	struct cpumask *cpus;
+	unsigned long max_capacity, capacity;
 
 	sg_policy = list_first_entry(&attr_set->policy_list, struct uag_gov_policy, tunables_hook);
 	if (!sg_policy) {
@@ -1592,7 +1398,11 @@ static ssize_t soft_limit_freq_store(struct gov_attr_set *attr_set, const char *
 
 	policy = sg_policy->policy;
 	cpus = policy->related_cpus;
-	topology_update_thermal_pressure(cpus, soft_freq);
+	max_capacity = arch_scale_cpu_capacity(cpumask_first(cpus));
+	capacity = soft_freq * max_capacity;
+	capacity /= policy->cpuinfo.max_freq;
+	arch_set_thermal_pressure(cpus, max_capacity - capacity);
+
 	return count;
 }
 
@@ -1651,7 +1461,7 @@ static ssize_t cobuck_enable_store(struct gov_attr_set *attr_set, const char *bu
 	return count;
 }
 
-
+#ifdef CONFIG_OPLUS_MULTI_LV_TL
 static ssize_t multi_tl_enable_show(struct gov_attr_set *attr_set, char *buf)
 {
 	struct uag_gov_tunables *tunables = to_uag_gov_tunables(attr_set);
@@ -1725,8 +1535,9 @@ static ssize_t multi_tl_sys_store(struct gov_attr_set *attr_set,
 		return -ENOMEM;
 
 	memcpy(new_util_loads, new_target_loads, sizeof(unsigned int) * ntokens);
-	for (i = 0; i < ntokens - 1; i += 2)
+	for (i = 0; i < ntokens - 1; i += 2) {
 		new_util_loads[i+1] = freq2util(sg_policy, new_target_loads[i+1]);
+	}
 
 	spin_lock_irqsave(&tunables->target_loads_lock, flags);
 	if (multi_tl->target_loads != default_target_loads_sys)
@@ -1742,78 +1553,12 @@ static ssize_t multi_tl_sys_store(struct gov_attr_set *attr_set,
 	return count;
 }
 
-static void update_min_rate_limit_ns(struct uag_gov_policy *sg_policy)
-{
-	mutex_lock(&min_rate_lock);
-	WRITE_ONCE(sg_policy->min_rate_limit_ns, min(sg_policy->up_rate_delay_ns,
-					   sg_policy->down_rate_delay_ns));
-	mutex_unlock(&min_rate_lock);
-}
-
-static ssize_t up_rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
-{
-	struct uag_gov_tunables *tunables = to_uag_gov_tunables(attr_set);
-
-	return sprintf(buf, "%u\n", tunables->up_rate_limit_us);
-}
-
-static ssize_t down_rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
-{
-	struct uag_gov_tunables *tunables = to_uag_gov_tunables(attr_set);
-
-	return sprintf(buf, "%u\n", tunables->down_rate_limit_us);
-}
-
-static ssize_t
-up_rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf, size_t count)
-{
-	struct uag_gov_tunables *tunables = to_uag_gov_tunables(attr_set);
-	struct uag_gov_policy *sg_policy;
-	unsigned int rate_limit_us;
-
-	if (kstrtouint(buf, 10, &rate_limit_us))
-		return -EINVAL;
-
-	tunables->up_rate_limit_us = rate_limit_us;
-
-	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook) {
-		sg_policy->up_rate_delay_ns = rate_limit_us * NSEC_PER_USEC;
-		update_min_rate_limit_ns(sg_policy);
-	}
-
-	return count;
-}
-
-static ssize_t
-down_rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf, size_t count)
-{
-	struct uag_gov_tunables *tunables = to_uag_gov_tunables(attr_set);
-	struct uag_gov_policy *sg_policy;
-	unsigned int rate_limit_us;
-
-	if (kstrtouint(buf, 10, &rate_limit_us))
-		return -EINVAL;
-
-	tunables->down_rate_limit_us = rate_limit_us;
-
-	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook) {
-		sg_policy->down_rate_delay_ns = rate_limit_us * NSEC_PER_USEC;
-		update_min_rate_limit_ns(sg_policy);
-	}
-
-	return count;
-}
-
-static struct governor_attr up_rate_limit_us =
-	__ATTR(up_rate_limit_us, 0664, up_rate_limit_us_show, up_rate_limit_us_store);
-static struct governor_attr down_rate_limit_us =
-	__ATTR(down_rate_limit_us, 0664, down_rate_limit_us_show, down_rate_limit_us_store);
-
-static struct governor_attr multi_tl_enable =
-	__ATTR(multi_tl_enable, 0664, multi_tl_enable_show, multi_tl_enable_store);
+static struct governor_attr multi_tl_enable = __ATTR_RW(multi_tl_enable);
 static struct governor_attr multi_tl_sys =
-	__ATTR(multi_tl_sys, 0664, multi_tl_sys_show, multi_tl_sys_store);
+    __ATTR(multi_tl_sys, 0664, multi_tl_sys_show, multi_tl_sys_store);
+#endif
 
+static struct governor_attr rate_limit_us = __ATTR_RW(rate_limit_us);
 static struct governor_attr hispeed_load = __ATTR_RW(hispeed_load);
 static struct governor_attr hispeed_freq = __ATTR_RW(hispeed_freq);
 static struct governor_attr cobuck_enable = __ATTR_RW(cobuck_enable);
@@ -1821,8 +1566,7 @@ static struct governor_attr cobuck_enable = __ATTR_RW(cobuck_enable);
 
 #ifdef CONFIG_OPLUS_UAG_AMU_AWARE
 static struct governor_attr stall_aware = __ATTR_RW(stall_aware);
-static struct governor_attr reduce_pct_of_stall = __ATTR_RW(reduce_pct_of_stall);
-static struct governor_attr max_stall_reduce_of_util = __ATTR_RW(max_stall_reduce_of_util);
+static struct governor_attr stall_reduce_pct = __ATTR_RW(stall_reduce_pct);
 static struct governor_attr report_policy = __ATTR_RW(report_policy);
 #endif
 
@@ -1841,21 +1585,24 @@ static struct governor_attr soft_limit_enable =
 #endif
 
 static struct attribute *uag_gov_attrs[] = {
-	&up_rate_limit_us.attr,
-	&down_rate_limit_us.attr,
+	&rate_limit_us.attr,
 	&hispeed_load.attr,
 	&hispeed_freq.attr,
 	&cobuck_enable.attr,
+#ifdef CONFIG_OPLUS_UAG_USE_TL
+	&target_loads.attr,
+#endif
 
 #ifdef CONFIG_OPLUS_UAG_AMU_AWARE
 	&stall_aware.attr,
-	&reduce_pct_of_stall.attr,
-	&max_stall_reduce_of_util.attr,
+	&stall_reduce_pct.attr,
 	&report_policy.attr,
 #endif
 
+#ifdef CONFIG_OPLUS_MULTI_LV_TL
 	&multi_tl_sys.attr,
 	&multi_tl_enable.attr,
+#endif
 
 #ifdef CONFIG_OPLUS_UAG_SOFT_LIMIT
 	&soft_limit_freq.attr,
@@ -1894,7 +1641,6 @@ static inline void uag_gov_cpu_reset(struct uag_gov_policy *sg_policy)
 
 	for_each_cpu(cpu, sg_policy->policy->cpus) {
 		struct uag_gov_cpu *sg_cpu = &per_cpu(uag_gov_cpu, cpu);
-
 		sg_cpu->sg_policy = NULL;
 	}
 }
@@ -2020,12 +1766,11 @@ static void uag_gov_tunables_restore(struct cpufreq_policy *policy)
 	tunables->hispeed_freq = cached->hispeed_freq;
 }
 
-#ifdef CONFIG_ARCH_MEDIATEK
-/*
- *cpu enter idle vendor hook
- *curr_frame_start: current frame start timestamp
- *prev_frame_start: prev frame start timestamp
- */
+#ifdef ONFIG_ARCH_MEDIATEK
+/*cpu enter idle vendor hook
+*curr_frame_start: current frame start timestamp
+*prev_frame_start: prev frame start timestamp
+*/
 static void android_vh_cpu_idle_enter_handler(void *unused, int *index, struct cpuidle_device *dev)
 {
 	struct uag_gov_cpu *ug_cpu = &per_cpu(uag_gov_cpu, dev->cpu);
@@ -2043,20 +1788,19 @@ static void android_vh_cpu_idle_enter_handler(void *unused, int *index, struct c
 	/*if current frame start too late to update*/
 	if ((ug_cpu->prev_enter_ilde <= curr_frame_start) && (ug_cpu->exit_idle >= curr_frame_start)
 		&& (ug_cpu->idle_duration != ug_cpu->exit_idle - curr_frame_start)) {
-		if (ug_cpu->prev_enter_ilde <= prev_frame_start)
+		if (ug_cpu->prev_enter_ilde <= prev_frame_start) {
 			ug_cpu->prev_idle_duration = curr_frame_start - prev_frame_start;
-		else
+		} else
 			ug_cpu->prev_idle_duration = ug_cpu->idle_duration - (ug_cpu->exit_idle - curr_frame_start);
 		ug_cpu->idle_duration = ug_cpu->exit_idle - curr_frame_start;
 	}
 
-	/*
-	 *cpu exit idle before current frame
-	 *       prev_frame           curr_frame
-	 *         |      _____exit idle   |  ___enter idle
-	 *eg:______|_____|_____|___________|_|___
-	 *		  prev_frame_duration
-	 */
+    /*cpu exit idle before current frame
+    *       prev_frame           curr_frame
+    *         |      _____exit idle   |  ___enter idle
+    *eg:______|_____|_____|___________|_|___
+    *		  prev_frame_duration
+    */
 	if ((ug_cpu->enter_idle >= curr_frame_start) && (ug_cpu->exit_idle <= curr_frame_start)) {
 		ug_cpu->prev_idle_duration = ug_cpu->idle_duration;
 		ug_cpu->idle_duration = 0;
@@ -2088,23 +1832,21 @@ static void android_vh_cpu_idle_exit_handler(void *unused, int index, struct cpu
 	ug_cpu->prev_exit_idle = ug_cpu->exit_idle;
 	ug_cpu->exit_idle = now;
 
-	/*
-	 *if cpu enter idle before prev frame start, then
-	 *prev frame duration equals to prev frame length.
-	 *           prev frame   curr frame
-	 *    enter idle _|___________|__exit idle
-	 *eg:___________|_|___________|__|_______
-	 */
+    /*if cpu enter idle before prev frame start, then
+    *prev frame duration equals to prev frame length.
+    *           prev frame   curr frame
+    *    enter idle _|___________|__exit idle
+    *eg:___________|_|___________|__|_______
+    */
 	if (ug_cpu->enter_idle <= prev_frame_start) {
 		ug_cpu->prev_idle_duration = curr_frame_start - prev_frame_start;
 	} else if (ug_cpu->enter_idle <= curr_frame_start) {
-		/*
-		 *if cpu enter idle before current frame
-		 *      prev_frame   curr_frame
-		 *         |  enter dile___|____exit idle
-		 *eg:______|___________|___|____|___
-		 *		  prev_frame_duration
-		 */
+	    /*if cpu enter idle before current frame
+	    *      prev_frame   curr_frame
+	    *         |  enter dile___|____exit idle
+	    *eg:______|___________|___|____|___
+	    *		  prev_frame_duration
+	    */
 		ug_cpu->prev_idle_duration =
 			ug_cpu->idle_duration + (curr_frame_start - ug_cpu->enter_idle);
 		if (now >= curr_frame_start)
@@ -2153,6 +1895,18 @@ static int uag_gov_init(struct cpufreq_policy *policy)
 	}
 #endif
 
+#if IS_ENABLED(CONFIG_OPLUS_OMRG)
+	omrg_cpufreq_register(policy);
+#endif
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_OCH)
+	if(cpufreq_health_register(policy))
+		pr_err("cpufreq health init failed!\n");
+#endif
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_GKI_CPUFREQ_BOUNCING)
+	cb_stuff_init(policy);
+#endif
 	cpufreq_enable_fast_switch(policy);
 
 	sg_policy = uag_gov_policy_alloc(policy);
@@ -2162,14 +1916,7 @@ static int uag_gov_init(struct cpufreq_policy *policy)
 	}
 
 	first_cpu = cpumask_first(policy->related_cpus);
-	cluster_id = topology_cluster_id(first_cpu);
-#ifdef CONFIG_OPLUS_UAG_USE_TL
-#ifdef CONFIG_UAG_NONLINEAR_FREQ_CTL
-	sg_policy->len = pd_get_nr_caps(cluster_id);
-#else
-	sg_policy->len = get_opp_count(policy);
-#endif
-#endif
+	cluster_id = topology_physical_package_id(first_cpu);
 
 	ret = uag_gov_kthread_create(sg_policy);
 	if (ret)
@@ -2195,12 +1942,12 @@ static int uag_gov_init(struct cpufreq_policy *policy)
 		goto stop_kthread;
 	}
 
-	tunables->up_rate_limit_us = cpufreq_policy_transition_delay_us(policy);
-	tunables->down_rate_limit_us = cpufreq_policy_transition_delay_us(policy);
-
+	tunables->rate_limit_us = cpufreq_policy_transition_delay_us(policy);
 	tunables->hispeed_load = DEFAULT_HISPEED_LOAD;
 	tunables->hispeed_freq = 0;
 	tunables->cobuck_enable = 0;
+
+	sg_policy->hispeed_util = target_util(sg_policy, tunables->hispeed_freq);
 #ifdef CONFIG_OPLUS_UAG_USE_TL
 	tunables->target_loads = default_target_loads;
 	tunables->ntarget_loads = ARRAY_SIZE(default_target_loads);
@@ -2218,9 +1965,8 @@ static int uag_gov_init(struct cpufreq_policy *policy)
 
 #ifdef CONFIG_OPLUS_UAG_AMU_AWARE
 	/* init stall cal */
-	tunables->stall_aware = 0;
-	tunables->reduce_pct_of_stall = 70;
-	tunables->max_stall_reduce_of_util = 5;
+	tunables->stall_aware = 1;
+	tunables->stall_reduce_pct = 70;
 	tunables->report_policy = REPORT_REDUCE_STALL;
 #endif
 
@@ -2279,7 +2025,7 @@ static void uag_gov_exit(struct cpufreq_policy *policy)
 	int cluster_id;
 
 	first_cpu = cpumask_first(policy->related_cpus);
-	cluster_id = topology_cluster_id(first_cpu);
+	cluster_id = topology_physical_package_id(first_cpu);
 	if (cluster_id < MAX_CLUSTERS)
 		init_flag[cluster_id] = 0;
 
@@ -2305,18 +2051,11 @@ static int uag_gov_start(struct cpufreq_policy *policy)
 	struct uag_gov_policy *sg_policy = policy->governor_data;
 	unsigned int cpu;
 
-	sg_policy->up_rate_delay_ns =
-		sg_policy->tunables->up_rate_limit_us * NSEC_PER_USEC;
-	sg_policy->down_rate_delay_ns =
-		sg_policy->tunables->down_rate_limit_us * NSEC_PER_USEC;
-	update_min_rate_limit_ns(sg_policy);
+	sg_policy->freq_update_delay_ns	= sg_policy->tunables->rate_limit_us * NSEC_PER_USEC;
 	sg_policy->last_freq_update_time	= 0;
 	sg_policy->next_freq			= 0;
 	sg_policy->work_in_progress		= false;
 	sg_policy->limits_changed		= false;
-#ifdef CONFIG_OPLUS_UAG_SOFT_LIMIT
-	sg_policy->soft_limits_changed		= false;
-#endif
 	sg_policy->cached_raw_freq		= 0;
 #if IS_ENABLED(CONFIG_OPLUS_FEATURE_FRAME_BOOST)
 	sg_policy->flags = 0;
@@ -2342,18 +2081,14 @@ static int uag_gov_start(struct cpufreq_policy *policy)
 
 	for_each_cpu(cpu, policy->cpus) {
 		struct uag_gov_cpu *sg_cpu = &per_cpu(uag_gov_cpu, cpu);
-		cpufreq_add_update_util_hook(cpu, &sg_cpu->cb,
+		cpufreq_add_update_util_hook(cpu, &sg_cpu->update_util,
 					     policy_is_shared(policy) ?
 							uag_gov_update_shared :
 							uag_gov_update_single);
 	}
 
 #if IS_ENABLED(CONFIG_OPLUS_FEATURE_FRAME_BOOST)
-#ifdef CONFIG_ARCH_MEDIATEK
 	fbg_add_update_freq_hook(cpufreq_update_util);
-#else
-	fbg_add_update_freq_hook(waltgov_run_callback);
-#endif /* CONFIG_ARCH_MEDIATEK */
 #endif
 	return 0;
 }
@@ -2391,7 +2126,7 @@ static void uag_gov_limits(struct cpufreq_policy *policy)
 #ifdef CONFIG_OPLUS_SYSTEM_KERNEL_QCOM
 		raw_spin_lock_irqsave(&sg_policy->update_lock, flags);
 		uag_track_cycles(sg_policy, sg_policy->policy->cur,
-				   walt_sched_clock());
+				   ktime_get_ns());
 		raw_spin_unlock_irqrestore(&sg_policy->update_lock, flags);
 #endif
 		cpufreq_policy_apply_limits(policy);
@@ -2414,8 +2149,10 @@ static void uag_gov_limits(struct cpufreq_policy *policy)
 		 * to do any sort of additional validation here.
 		 */
 		final_freq = cpufreq_driver_resolve_freq(policy, freq);
-		uag_gov_fast_switch(sg_policy, now, final_freq);
 
+		if (uag_gov_update_next_freq(sg_policy, now, final_freq)) {
+			uag_gov_fast_switch(sg_policy, now, final_freq);
+		}
 		raw_spin_unlock_irqrestore(&sg_policy->update_lock, flags);
 #endif
 	}
@@ -2443,11 +2180,11 @@ static void register_uag_hooks(void)
 #endif /* CONFIG_ARCH_MEDIATEK */
 
 #if defined(CONFIG_OPLUS_UAG_USE_TL) && defined(CONFIG_OPLUS_SYSTEM_KERNEL_QCOM)
-	register_trace_android_vh_map_util_freq(uag_update_util, NULL);
+	register_trace_android_vh_map_util_freq_new(uag_update_util, NULL);
 #endif
 
 #if defined(CONFIG_UAG_NONLINEAR_FREQ_CTL) && defined(CONFIG_ARCH_MEDIATEK)
-	register_trace_android_vh_map_util_freq(nonlinear_map_util_freq, NULL);
+	register_trace_android_vh_map_util_freq_new(nonlinear_map_util_freq, NULL);
 #endif
 }
 
@@ -2460,11 +2197,11 @@ static void unregister_uag_hooks(void)
 #endif /* CONFIG_ARCH_MEDIATEK */
 
 #if defined(CONFIG_OPLUS_UAG_USE_TL) && defined(CONFIG_OPLUS_SYSTEM_KERNEL_QCOM)
-	unregister_trace_android_vh_map_util_freq(uag_update_util, NULL);
+	unregister_trace_android_vh_map_util_freq_new(uag_update_util, NULL);
 #endif
 
 #if defined(CONFIG_UAG_NONLINEAR_FREQ_CTL) && defined(CONFIG_ARCH_MEDIATEK)
-	unregister_trace_android_vh_map_util_freq(nonlinear_map_util_freq, NULL);
+	unregister_trace_android_vh_map_util_freq_new(nonlinear_map_util_freq, NULL);
 #endif
 }
 
@@ -2518,52 +2255,21 @@ static inline void multi_tl_proc_create(struct proc_dir_entry *dir)
 }
 #endif
 
-#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
-static int __nocfi DetectSymbol(void)
-{
-	int ret;
-	static struct kprobe kp = {
-	    .symbol_name = "stune_util"
-	};
-
-	ret = register_kprobe(&kp);
-	if (ret < 0) {
-		pr_warn("Bypass  failed\n");
-		return ret;
-	}
-	_stune_util = (stune_util_t)kp.addr;
-	pr_info("_stune_util:%ps\n", _stune_util);
-	unregister_kprobe(&kp);
-	return 0;
-}
-#endif
-
 static int __init cpufreq_uag_init(void)
 {
 	int ret = 0;
 
-	ret = cpufreq_register_governor(&cpufreq_uag_gov);
-	if (ret)
-		return ret;
-
 	dir = proc_mkdir("uag", NULL);
-	if (!dir) {
-		pr_err("proc/uag create failed\n");
-		goto out;
-	}
 
 #ifdef CONFIG_OPLUS_MULTI_LV_TL
 	if (dir)
 		multi_tl_proc_create(dir);
 #endif
-	register_uag_hooks();
-#if IS_ENABLED(CONFIG_OPLUS_SCHED_TUNE)
-	DetectSymbol();
-#endif
-	return ret;
 
-out:
-	cpufreq_unregister_governor(&cpufreq_uag_gov);
+	register_uag_hooks();
+
+	ret = cpufreq_register_governor(&cpufreq_uag_gov);
+
 	return ret;
 }
 

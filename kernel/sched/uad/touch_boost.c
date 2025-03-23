@@ -65,7 +65,6 @@ static void cpu_freq_systrace_c(int cpu, int freq)
 {
 	if (touch_boost_trace_debug) {
 		char buf[256];
-
 		snprintf(buf, sizeof(buf), "C|9999|touch_boost_min_cpu%d|%d\n", cpu, freq);
 		tracing_mark_write(buf);
 	}
@@ -273,7 +272,7 @@ static void do_input_boost(struct work_struct *work)
 			continue;
 		}
 		first_cpu = cpumask_first(policy->related_cpus);
-		cluster_id = topology_cluster_id(first_cpu);
+		cluster_id = topology_physical_package_id(first_cpu);
 		cpufreq_cpu_put(policy);
 		if (cluster_id >= MAX_CLUSTERS)
 			continue;
@@ -309,7 +308,7 @@ static void inputboost_input_event(struct input_handle *handle,
 			continue;
 		}
 		first_cpu = cpumask_first(policy->related_cpus);
-		cluster_id = topology_cluster_id(first_cpu);
+		cluster_id = topology_physical_package_id(first_cpu);
 		cpufreq_cpu_put(policy);
 		if (cluster_id >= MAX_CLUSTERS)
 			continue;
@@ -431,7 +430,7 @@ static int cluster_init(int first_cpu, struct device *dev)
 	if (!policy)
 		return -EINVAL;
 
-	cluster_id = topology_cluster_id(first_cpu);
+	cluster_id = topology_physical_package_id(first_cpu);
 	if (cluster_id >= MAX_CLUSTERS) {
 		pr_err("Unsupported number of clusters(%d). Only %u supported\n",
 				cluster_id,

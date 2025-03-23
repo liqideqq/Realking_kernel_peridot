@@ -8,12 +8,11 @@
 #include <linux/cpu.h>
 #include <linux/cpufreq.h>
 #include <linux/sched.h>
-#include <trace/hooks/sched.h>
-#include <linux/sched/cputime.h>
 #include <../kernel/sched/sched.h>
 
 #include <trace/events/sched.h>
 
+#include "cpufreq_uag.h"
 #include "stall_util_cal.h"
 
 #include "uag_trace.h"
@@ -34,7 +33,7 @@ void uag_adjust_util(int cpu, unsigned long *util, void *ptr)
 	struct uag_gov_policy *sg_pol = (struct uag_gov_policy *) ptr;
 	struct uag_gov_tunables *tunables = sg_pol->tunables;
 	unsigned long orig = *util;
-	u64 normal, stall, reduce_pct, reduce_stall;
+	u64 normal, stall, reduce_pct;
 	s64 result, result_2;
 
 	if (unlikely(!uag_amu_enable))
@@ -43,14 +42,12 @@ void uag_adjust_util(int cpu, unsigned long *util, void *ptr)
 	if (!tunables->stall_aware)
 		return;
 
-	reduce_pct = tunables->reduce_pct_of_stall;
+	reduce_pct = tunables->stall_reduce_pct;
 
 	normal = min(per_cpu(amu_normal_util, cpu), 1024LLU);
 	stall = min(per_cpu(amu_stall_util, cpu), 1024LLU);
-	reduce_stall = stall * reduce_pct / 100;
+	result = orig - (stall * reduce_pct / 100);
 	result_2 = normal - (stall * reduce_pct / 100);
-	reduce_stall = min_t(u64, reduce_stall, orig * tunables->max_stall_reduce_of_util / 100);
-	result = orig - reduce_stall;
 
 	/* adjust policy */
 	switch (tunables->report_policy) {
@@ -58,6 +55,9 @@ void uag_adjust_util(int cpu, unsigned long *util, void *ptr)
 		break;
 	case REPORT_MAX_UTIL:
 		*util = max_t(s64, normal, orig);
+		break;
+	case REPORT_MIN_UTIL:
+		*util = 0;
 		break;
 	case REPORT_DIRECT:
 		*util = normal;
@@ -91,15 +91,64 @@ static inline u64 get_max_freq(void)
 	return freq;
 }
 
-/* ms */
-#define STALL_AWARE_MIN_DURATION  8
-static void uag_amu_update_this_cpu(u64 time)
+void uag_update_counter(void *ptr)
+{
+	int cpu, i;
+	struct uag_gov_policy *sg_pol = (struct uag_gov_policy *) ptr;
+	struct cpufreq_policy *pol = sg_pol->policy;
+	struct uag_gov_tunables *tunables = sg_pol->tunables;
+	u64 max_freq = get_max_freq();
+	u64 time = ktime_get();
+
+	if (unlikely(!uag_amu_enable))
+		return;
+
+	if (!tunables->stall_aware)
+		return;
+
+	if (!max_freq)
+		return;
+
+	for_each_cpu(cpu, pol->cpus) {
+		struct amu_data data;
+		u64 delta_cycle, delta_stall_cycle, delta_time;
+
+		for (i = 0; i < SYS_AMU_MAX; ++i) {
+			data.val[i] = per_cpu(amu_cntr, cpu).val[i];
+			per_cpu(amu_delta, cpu).val[i] = data.val[i] - per_cpu(amu_prev_cntr, cpu).val[i];
+			per_cpu(amu_prev_cntr, cpu).val[i] = data.val[i];
+		}
+		per_cpu(amu_update_delta_time, cpu) = delta_time = ktime_sub(time, per_cpu(amu_last_update_time, cpu));
+		per_cpu(amu_last_update_time, cpu) = time;
+
+		delta_cycle = per_cpu(amu_delta, cpu).val[SYS_AMU_CORE_CYC];
+		delta_stall_cycle = per_cpu(amu_delta, cpu).val[SYS_AMU_STALL_MEM];
+
+		if (delta_time) {
+			/* delta_time: ns */
+			per_cpu(amu_normal_util, cpu) = delta_cycle ?
+				((delta_cycle * 1000000LLU * 1024LLU) / delta_time) / max_freq : 0;
+
+			per_cpu(amu_stall_util, cpu) = delta_stall_cycle ?
+				((delta_stall_cycle * 1000000LLU * 1024LLU) / delta_time) / max_freq : 0;
+
+		} else {
+			per_cpu(amu_normal_util, cpu) = 0;
+			per_cpu(amu_stall_util, cpu) = 0;
+		}
+
+		trace_uag_update_amu_counter(cpu, time);
+	}
+}
+
+static void uag_single_update(void *unused, struct task_struct *tsk,
+	u64 runtime, u64 vruntime)
 {
 	int cpu = smp_processor_id();
 	int i;
 
-	if (ktime_sub(time, per_cpu(amu_last_update_time, cpu)) <= STALL_AWARE_MIN_DURATION * NSEC_PER_MSEC)
-		return;
+	/* FIXME debug for MT6895 */
+	return;
 
 	for (i = 0; i < SYS_AMU_MAX; ++i) {
 		switch (i) {
@@ -116,75 +165,14 @@ static void uag_amu_update_this_cpu(u64 time)
 			per_cpu(amu_cntr, cpu).val[i] = read_sysreg_s(SYS_AMEVCNTR0_MEM_STALL);
 			break;
 		}
-
-		per_cpu(amu_delta, cpu).val[i] = per_cpu(amu_cntr, cpu).val[i] - per_cpu(amu_prev_cntr, cpu).val[i];
-		per_cpu(amu_prev_cntr, cpu).val[i] = per_cpu(amu_cntr, cpu).val[i];
 	}
-
-	per_cpu(amu_update_delta_time, cpu) = ktime_sub(time, per_cpu(amu_last_update_time, cpu));
-	per_cpu(amu_last_update_time, cpu) = time;
-	trace_uag_update_amu_counter(cpu, time);
-}
-
-void uag_update_counter(struct uag_gov_policy *sg_pol)
-{
-	int cpu;
-	struct cpufreq_policy *pol = sg_pol->policy;
-	struct uag_gov_tunables *tunables = sg_pol->tunables;
-	u64 max_freq = get_max_freq();
-
-	if (unlikely(!uag_amu_enable))
-		return;
-
-	if (!tunables->stall_aware)
-		return;
-
-	if (!max_freq)
-		return;
-
-	/* update statistics util for this policy */
-	for_each_cpu(cpu, pol->cpus) {
-		u64 delta_cycle, delta_stall_cycle, delta_time;
-
-		delta_time = per_cpu(amu_update_delta_time, cpu);
-		delta_cycle = per_cpu(amu_delta, cpu).val[SYS_AMU_CORE_CYC];
-		delta_stall_cycle = per_cpu(amu_delta, cpu).val[SYS_AMU_STALL_MEM];
-
-		if (delta_time) {
-			unsigned long avg_freq, max_freq, capacity, stall_avg;
-
-			/* delta_time: ns */
-			avg_freq = delta_cycle ? (delta_cycle * NSEC_PER_MSEC / delta_time) : pol->cur;
-			stall_avg = delta_stall_cycle ? (delta_stall_cycle * NSEC_PER_MSEC / delta_time) : 0;
-			max_freq = pol->cpuinfo.max_freq;
-			capacity = capacity_orig_of(cpu);
-			per_cpu(amu_normal_util, cpu) = avg_freq * capacity / max_freq;
-			per_cpu(amu_stall_util, cpu) = stall_avg * capacity / max_freq;
-			trace_uag_amu_cnt_calc(cpu, avg_freq, stall_avg, max_freq, capacity);
-
-		} else {
-			per_cpu(amu_normal_util, cpu) = 0;
-			per_cpu(amu_stall_util, cpu) = 0;
-		}
-	}
-}
-
-static void uag_amu_update_tick_handler(void *data, struct rq *rq)
-{
-	u64 now = ktime_get();
-
-	if (unlikely(!uag_amu_enable))
-		return;
-
-	/* update stall aware information for this cpu */
-	uag_amu_update_this_cpu(now);
 }
 
 void uag_register_stall_update(void)
 {
 	if (IS_ENABLED(CONFIG_ARM64_AMU_EXTN)) {
+		register_trace_sched_stat_runtime(uag_single_update, NULL);
 #ifdef CONFIG_ARCH_QCOM
-		register_trace_android_vh_scheduler_tick(uag_amu_update_tick_handler, NULL);
 		uag_amu_enable = 1;
 #else
 		uag_amu_enable = 0;
@@ -195,7 +183,7 @@ void uag_register_stall_update(void)
 void uag_unregister_stall_update(void)
 {
 	if (IS_ENABLED(CONFIG_ARM64_AMU_EXTN)) {
-		unregister_trace_android_vh_scheduler_tick(uag_amu_update_tick_handler, NULL);
 		uag_amu_enable = 0;
+		unregister_trace_sched_stat_runtime(uag_single_update, NULL);
 	}
 }

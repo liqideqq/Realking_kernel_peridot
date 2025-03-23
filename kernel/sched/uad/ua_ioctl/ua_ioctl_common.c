@@ -12,7 +12,7 @@
 #include <linux/seq_file.h>
 #include <../fs/proc/internal.h>
 #if IS_ENABLED(CONFIG_OPLUS_FEATURE_FRAME_BOOST)
-#include <../kernel/oplus_cpu/sched/frame_boost/frame_boost.h>
+#include <../sched/frame_boost/frame_boost.h>
 #endif
 
 #include "frame_ioctl.h"
@@ -139,24 +139,20 @@ static int __init ioctl_common_init(void)
 
 	pentry = proc_create("ua_ctrl", S_IRWXUGO, ua_common_proc, &cpu_ioctrl_fops);
 	if (!pentry)
-		goto ERROR_INIT;
+		return -ENOENT;
 
 	/* Create frame boost proc node */
 #if IS_ENABLED(CONFIG_OPLUS_FEATURE_FRAME_BOOST)
 	ret = frame_ioctl_init();
 	if (ret)
-		goto ERROR_INIT;
+		return ret;
 #endif
 
 	ret = touch_ioctl_init();
 	if (ret)
-		goto ERROR_INIT;
+		return ret;
 
 	return ret;
-
-ERROR_INIT:
-	remove_proc_entry(UA_PROC_NODE, NULL);
-	return -ENOENT;
 }
 
 static void __exit ioctl_common_exit(void)

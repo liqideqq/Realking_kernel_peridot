@@ -149,32 +149,6 @@ TRACE_EVENT(uag_update_amu_counter,
 		    __entry->time)
 );
 
-TRACE_EVENT(uag_amu_cnt_calc,
-	    TP_PROTO(int cpu,
-		    unsigned long avg_freq, unsigned long stall_avg,
-		    unsigned long max_freq, unsigned long capacity),
-	    TP_ARGS(cpu, avg_freq, stall_avg,
-		    max_freq, capacity),
-	    TP_STRUCT__entry(
-		    __field(int, cpu)
-		    __field(unsigned long, avg_freq)
-		    __field(unsigned long, stall_avg)
-		    __field(unsigned long, max_freq)
-		    __field(unsigned long, capacity)),
-	    TP_fast_assign(
-		    __entry->cpu = cpu;
-		    __entry->avg_freq = avg_freq;
-		    __entry->stall_avg = stall_avg;
-		    __entry->max_freq = max_freq;
-		    __entry->capacity = capacity;),
-	    TP_printk("cpu=%d avg_freq=%lu stall_avg=%lu max_freq=%lu capacity=%lu",
-		    __entry->cpu,
-		    __entry->avg_freq,
-		    __entry->stall_avg,
-		    __entry->max_freq,
-		    __entry->capacity)
-);
-
 TRACE_EVENT(uag_amu_adjust_util,
 	    TP_PROTO(int cpu,
 		    u64 orig, u64 normal, u64 stall, u64 reduce_pct,
@@ -306,23 +280,6 @@ TRACE_EVENT(soft_limit,
 			__entry->break_freq_margin,
 			__entry->util)
 );
-
-TRACE_EVENT(set_soft_limit_freq,
-	    TP_PROTO(unsigned int first_cpu, unsigned int soft_freq, unsigned long soft_util),
-	    TP_ARGS(first_cpu, soft_freq, soft_util),
-	    TP_STRUCT__entry(
-			__field(unsigned int, first_cpu)
-			__field(unsigned int, soft_freq)
-			__field(unsigned long, soft_util)),
-	    TP_fast_assign(
-			__entry->first_cpu = first_cpu;
-			__entry->soft_freq = soft_freq;
-			__entry->soft_util = soft_util;),
-	    TP_printk("first_cpu = %u soft_freq=%u soft_util=%u",
-			__entry->first_cpu,
-			__entry->soft_freq,
-			__entry->soft_util)
-);
 #endif
 
 #ifdef CONFIG_ARCH_MEDIATEK
@@ -347,7 +304,7 @@ TRACE_EVENT(hispeed_freq,
 TRACE_EVENT(ed_task_boost,
 
 	    TP_PROTO(unsigned long cpu_util, unsigned long util, unsigned int ed_task_boost_type,
-			unsigned int ed_task_boost_mid_util, unsigned int ed_task_boost_max_util),
+	             unsigned int ed_task_boost_mid_util, unsigned int ed_task_boost_max_util),
 
 	    TP_ARGS(cpu_util, util, ed_task_boost_type, ed_task_boost_mid_util, ed_task_boost_max_util),
 

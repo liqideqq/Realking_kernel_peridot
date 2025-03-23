@@ -9,8 +9,6 @@
 #include <linux/slab.h>
 #include <linux/cpumask.h>
 #include <linux/percpu.h>
-#include <linux/arch_topology.h>
-#include <linux/sched/cputime.h>
 #include <../kernel/sched/sched.h>
 #include <trace/hooks/topology.h>
 #ifdef CONFIG_OPLUS_UAG_USE_TL
@@ -21,6 +19,7 @@
 /************************************
  * Structure && Global data
  ************************************/
+#define MAX_PD_COUNT (3)
 #define CAPACITY_ENTRY_SIZE (0x2)
 
 struct pd_capacity_info {
@@ -102,7 +101,7 @@ static void nlopp_arch_set_freq_scale(void *data, const struct cpumask *cpus,
 		return;
 
 	cap = pd_get_opp_capacity(cpu, opp);
-	max_cap = arch_scale_cpu_capacity(cpu);
+	max_cap = pd_get_opp_capacity(cpu, 0);
 
 	*scale = SCHED_CAPACITY_SCALE * cap / max_cap;
 }
@@ -236,7 +235,7 @@ void uag_update_util(void *data, unsigned long util, unsigned long freq,
 	struct uag_gov_policy *sg_policy;
 
 	first_cpu = cpumask_first(policy->related_cpus);
-	cluster_id = topology_cluster_id(first_cpu);
+	cluster_id = topology_physical_package_id(first_cpu);
 
 	if (cluster_id >= MAX_CLUSTERS)
 		return;
@@ -246,8 +245,9 @@ void uag_update_util(void *data, unsigned long util, unsigned long freq,
 
 	sg_policy = policy->governor_data;
 
-	if (sg_policy)
+	if (sg_policy) {
 		update_util_tl(sg_policy, max_util);
+	}
 }
 #endif /* CONFIG_OPLUS_SYSTEM_KERNEL_QCOM */
 #endif /* CONFIG_OPLUS_UAG_USE_TL */
@@ -337,7 +337,7 @@ void nonlinear_map_util_freq(void *data, unsigned long util, unsigned long freq,
 	int cluster_id;
 
 	first_cpu = cpumask_first(policy->related_cpus);
-	cluster_id = topology_cluster_id(first_cpu);
+	cluster_id = topology_physical_package_id(first_cpu);
 
 	if (cluster_id < MAX_CLUSTERS && init_flag[cluster_id] == 1)
 		nlopp_map_util_freq(NULL, util, freq, policy->cpus, next_freq);
@@ -375,40 +375,7 @@ unsigned long cluster0_cap[17] = {146, 145, 144, 142, 140, 136, 133, 130, 126, 1
 				  115, 109, 103, 96, 79, 61, 46};
 #endif /* CONFIG_ARCH_MEDIATEK */
 
-static void sched_get_possible_siblings(int cpuid, struct cpumask *cluster_cpus)
-{
-	int cpu;
-	struct cpu_topology *cpu_topo, *cpuid_topo = &cpu_topology[cpuid];
 
-	if (cpuid_topo->cluster_id == -1)
-		return;
-
-	for_each_possible_cpu(cpu) {
-		cpu_topo = &cpu_topology[cpu];
-
-		if (cpuid_topo->cluster_id != cpu_topo->cluster_id)
-			continue;
-		cpumask_set_cpu(cpu, cluster_cpus);
-	}
-}
-
-static void cluster_init(void)
-{
-	struct cpumask cpus = *cpu_possible_mask;
-	struct cpumask cluster_cpus;
-	int i;
-	for_each_cpu(i, &cpus) {
-		cpumask_clear(&cluster_cpus);
-		sched_get_possible_siblings(i, &cluster_cpus);
-		if (cpumask_empty(&cluster_cpus)) {
-			WARN(1, "SCHED: Invalid cpu topology!!");
-			return;
-		}
-		cpumask_andnot(&cpus, &cpus, &cluster_cpus);
-		pd_count++;
-	}
-	pr_info("cluster_init pd_count:%d\n", pd_count);
-}
 static int init_capacity_table(void)
 {
 	int i, j, cpu;
@@ -471,17 +438,19 @@ static int init_capacity_table(void)
 #ifdef CONFIG_ARCH_MEDIATEK
 		for (j = 0; j < pd_info->nr_caps; j++) {
 			cap = c_cap[j];
-			if (j == pd_info->nr_caps - 1)
+			if (j == pd_info->nr_caps - 1) {
 				next_cap = -1;
-			else
+			} else {
 				next_cap = c_cap[j + 1];
+			}
 #else
 		for (j = pd_info->nr_caps-1; j >= 0; j--) {
 			cap = c_cap[j];
-			if (j == 0)
+			if (j == 0) {
 				next_cap = -1;
-			else
+			} else {
 				next_cap = c_cap[j - 1];
+			}
 #endif /* CONFIG_ARCH_MEDIATEK */
 
 			if (cap == 0 || next_cap == 0)
@@ -560,9 +529,8 @@ static int alloc_capacity_table(void)
 	int i;
 	int ret = 0;
 	int cur_tbl = 0;
-	if (!pd_count)
-		return -ENOENT;
-	pd_capacity_tbl = kcalloc(pd_count, sizeof(struct pd_capacity_info),
+
+	pd_capacity_tbl = kcalloc(MAX_PD_COUNT, sizeof(struct pd_capacity_info),
 			GFP_KERNEL);
 	if (!pd_capacity_tbl)
 		return -ENOMEM;
@@ -579,7 +547,7 @@ static int alloc_capacity_table(void)
 		if (i != cpumask_first(to_cpumask(pd->cpus)))
 			continue;
 
-		WARN_ON(cur_tbl >= pd_count);
+		WARN_ON(cur_tbl >= MAX_PD_COUNT);
 
 		nr_caps = pd->nr_perf_states;
 		pd_capacity_tbl[cur_tbl].nr_caps = nr_caps;
@@ -597,6 +565,8 @@ static int alloc_capacity_table(void)
 		cur_tbl++;
 	}
 
+	pd_count = cur_tbl;
+
 	return 0;
 
 nomem:
@@ -611,7 +581,7 @@ static int pd_capacity_tbl_show(struct seq_file *m, void *v)
 	int i, j;
 	struct pd_capacity_info *pd_info;
 
-	for (i = 0; i < pd_count; i++) {
+	for (i = 0; i < MAX_PD_COUNT; i++) {
 		pd_info = &pd_capacity_tbl[i];
 
 		if (!pd_info->nr_caps)
@@ -645,7 +615,7 @@ int init_opp_cap_info(struct proc_dir_entry *dir)
 
 	if (pd_capacity_tbl)
 		return ret;
-	cluster_init();
+
 	ret = alloc_capacity_table();
 	if (ret)
 		return ret;
@@ -665,14 +635,8 @@ int init_opp_cap_info(struct proc_dir_entry *dir)
 		pr_err("proc/uag/pd_capacity_tbl entry create failed\n");
 
 	ret = register_trace_android_vh_arch_set_freq_scale(nlopp_arch_set_freq_scale, NULL);
-	if (ret) {
-		pr_err("register android_vh_arch_set_freq_scale failed\n");
-	} else {
-#ifdef CONFIG_ARCH_MEDIATEK
-		/* using nolinear freq scale instead of amu */
-		topology_clear_scale_freq_source(SCALE_FREQ_SOURCE_ARCH, cpu_possible_mask);
-#endif /* CONFIG_ARCH_MEDIATEK */
-	}
+	if (ret)
+		return ret;
 
 	return ret;
 }
